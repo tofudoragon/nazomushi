@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>謎虫ライダー ～クラーク会館から食堂へ～</title>
+<style>
+  body{margin:0;background:#2b2118;color:#fff;font-family:"Hiragino Sans","Yu Gothic",Meiryo,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh}
+  #wrap{position:relative;width:min(100vw,800px)}
+  canvas{width:100%;display:block;background:#000;touch-action:none}
+  #ov{position:absolute;inset:0;background:rgba(30,18,8,.88);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:14px;box-sizing:border-box;overflow:auto;line-height:1.55;font-size:clamp(11px,2.1vw,16px)}
+  #ov h1{margin:0 0 6px;font-size:clamp(18px,4vw,30px);color:#ffb347}
+  #ov .box{background:rgba(255,255,255,.1);border-radius:8px;padding:6px 12px;margin:4px 0;max-width:620px;text-align:left}
+  button{font-size:clamp(14px,2.8vw,20px);padding:8px 28px;border:0;border-radius:8px;background:#ff8c1a;color:#fff;cursor:pointer;margin-top:8px}
+  button:hover{background:#ff6f00}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="800" height="500"></canvas>
+  <div id="ov"></div>
+</div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d'), ov = document.getElementById('ov');
+const W = 3, CAMH = 1.2, HOR = 190, F = 420;      // 道幅の半分(m), カメラ高さ, 地平線, 焦点距離
+const GOAL = 600, BASE = 4, MAXV = 13;            // ゴール距離, 初速, 最高速度
+let state = 'intro', d, v, px, bugs, splats, dog, nextDog, spawnZ, time, keys = {}, msg = '', msgT = 0, overWhy = '';
+let audio;
+
+// ---------- 効果音 ----------
+function splat() {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const n = audio.sampleRate * 0.25, buf = audio.createBuffer(1, n, audio.sampleRate), ch = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 2);
+    const s = audio.createBufferSource(), f = audio.createBiquadFilter(), g = audio.createGain();
+    s.buffer = buf; f.type = 'lowpass'; f.frequency.value = 500; g.gain.value = 1.2;
+    s.connect(f); f.connect(g); g.connect(audio.destination); s.start();
+  } catch (e) {}
+}
+function beep(freq, len) {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.frequency.value = freq; g.gain.value = 0.15; o.connect(g); g.connect(audio.destination);
+    o.start(); o.stop(audio.currentTime + len);
+  } catch (e) {}
+}
+
+// ---------- 画面（説明・結果） ----------
+function showIntro() {
+  state = 'intro';
+  ov.style.display = 'flex';
+  ov.innerHTML = `
+    <h1>謎虫ライダー</h1>
+    <div style="margin-bottom:4px">クラーク会館 → 食堂　最速ゴールをめざせ！</div>
+    <div class="box"><b>🪰 謎虫とは？</b><br>寒くなり、秋が近づくころに現れる謎の小さい虫。木の周りを通ると大量にいる。当たると「べチャ」…あの嫌な気持ちを思い出そう。</div>
+    <div class="box"><b>🐕 犬の要素</b><br>道の左右どちらかに犬が現れる。犬のいる方向へ寄ると<b>スピード大幅アップ！</b>ただしよそ見運転なので<b>2%の確率でゲームオーバー</b>。</div>
+    <div class="box"><b>ルール</b><br>・食堂に着いたらゴール（タイムを計測）<br>・謎虫に当たらないと少しずつ加速、当たると減速<br>・基本ゲームオーバーにならない（例外は犬）</div>
+    <div class="box"><b>操作</b>　十字キーの ← → （スマホは画面の左半分／右半分をタップ）</div>
+    <button id="go">スタート</button>`;
+  document.getElementById('go').onclick = start;
+}
+function end(win, why) {
+  state = win ? 'goal' : 'over';
+  overWhy = why;
+  if (win) beep(660, .3);
+  ov.style.display = 'flex';
+  ov.innerHTML = win
+    ? `<h1>🍴 食堂に到着！</h1><div style="font-size:1.6em;margin:8px">タイム：<b>${time.toFixed(2)} 秒</b></div><div>おつかれさま！もっと速く行けるかな？</div><button id="go">もう一度</button>`
+    : `<h1>💥 ゲームオーバー</h1><div style="margin:8px">${why}</div><div>進んだ距離：${Math.floor(d)} m</div><button id="go">リスタート</button>`;
+  document.getElementById('go').onclick = start;
+}
+
+// ---------- ゲーム開始・更新 ----------
+function start() {
+  audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+  d = 0; v = BASE; px = 0; bugs = []; splats = []; dog = null; time = 0; msg = ''; msgT = 0;
+  spawnZ = 25; nextDog = 6 + Math.random() * 4;
+  ov.style.display = 'none';
+  state = 'play';
+}
+function say(t) { msg = t; msgT = 1.5; }
+
+function update(dt) {
+  time += dt;
+  // 操作
+  let dir = (keys.ArrowRight ? 1 : 0) - (keys.ArrowLeft ? 1 : 0);
+  px = Math.max(-1, Math.min(1, px + dir * 2.0 * dt));
+  // 速度（最高速度に達しても操作しやすいよう一定でキープ）
+  if (v < MAXV) v = Math.min(MAXV, v + 0.3 * dt); else v = Math.max(MAXV, v - 4 * dt);
+  d += v * dt;
+  // 謎虫の出現
+  while (spawnZ < d + 70) {
+    const n = 1 + Math.floor(Math.random() * 2), bx = Math.random() * 2 - 1;
+    for (let i = 0; i < n; i++)
+      bugs.push({ z: spawnZ + i * 0.5, x: Math.max(-1, Math.min(1, bx + i * 0.35)), y: Math.random() * 1.2 - 0.4, hit: false, ph: Math.random() * 9 });
+    spawnZ += 5 + Math.random() * 6 - Math.min(2, d / 300);
+  }
+  bugs = bugs.filter(b => b.z > d - 3);
+  // 当たり判定
+  for (const b of bugs) {
+    if (!b.hit && Math.abs(b.z - d) < 0.7 && Math.abs(b.x - px) < 0.3) {
+      b.hit = true; v = Math.max(2.5, v * 0.55); splat();
+      for (let i = 0; i < 4; i++) splats.push({ x: 150 + Math.random() * 500, y: 80 + Math.random() * 280, r: 20 + Math.random() * 35, life: 2.5 });
+    }
+  }
+  splats.forEach(s => s.life -= dt); splats = splats.filter(s => s.life > 0);
+  // 犬
+  nextDog -= dt;
+  if (!dog && nextDog <= 0) { dog = { side: Math.random() < .5 ? -1 : 1, life: 3 }; say('🐕 犬がいる！' + (dog.side < 0 ? '左' : '右')); }
+  if (dog) {
+    dog.life -= dt;
+    if (px * dog.side > 0.6) {            // 犬のいる方向へ寄った
+      if (Math.random() < 0.02) { end(false, '犬に気を取られて…よそ見運転で転倒！'); return; }
+      v = Math.min(MAXV * 1.9, v + 8); say('🐕 スピードアップ！'); beep(880, .12);
+      dog = null; nextDog = 6 + Math.random() * 5;
+    } else if (dog.life <= 0) { dog = null; nextDog = 5 + Math.random() * 5; }
+  }
+  if (msgT > 0) msgT -= dt;
+  if (d >= GOAL) end(true);
+}
+
+// ---------- 描画 ----------
+function proj(wx, wy, dz) { return [400 + (wx - px * W) * F / dz, HOR + (CAMH - wy) * F / dz]; }
+
+function drawTree(side, z, i) {
+  const dz = z - d; if (dz < 1.2) return;
+  const [sx, gy] = proj(side * (W + 1.6), 0, dz), k = F / dz;
+  ctx.fillStyle = '#5a3a1e'; ctx.fillRect(sx - 0.2 * k, gy - 3.4 * k, 0.4 * k, 3.4 * k);
+  const cols = ['#d9531e', '#e8a317', '#b5361c', '#c98b12'];
+  ctx.fillStyle = cols[i % 4];
+  ctx.beginPath(); ctx.arc(sx, gy - 4.3 * k, 1.7 * k, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(sx - 0.9 * k, gy - 3.6 * k, 1.1 * k, 0, 7); ctx.arc(sx + 0.9 * k, gy - 3.6 * k, 1.1 * k, 0, 7); ctx.fill();
+  // 木の周りの謎虫（演出）
+  if (dz < 30) {
+    ctx.fillStyle = '#111';
+    for (let j = 0; j < 10; j++) {
+      const a = time * 3 + j * 1.9 + i, r = (0.6 + (j % 4) * 0.35) * k;
+      ctx.fillRect(sx + Math.cos(a) * r * 1.6, gy - 3.2 * k + Math.sin(a * 1.3) * r, Math.max(1.5, 0.07 * k), Math.max(1.5, 0.07 * k));
+    }
+  }
+}
+function drawBug(b) {
+  const dz = b.z - d; if (dz < 0.6) return;
+  const [sx, sy] = proj(b.x * W, CAMH + b.y - 0.4, dz), k = F / dz;
+  ctx.fillStyle = '#1a1a1a';
+  for (let j = 0; j < 6; j++) {
+    const a = time * 8 + b.ph + j * 1.1;
+    ctx.beginPath(); ctx.arc(sx + Math.cos(a) * 0.12 * k, sy + Math.sin(a * 1.4) * 0.1 * k, Math.max(1.5, 0.06 * k), 0, 7); ctx.fill();
+  }
+  ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.beginPath(); ctx.arc(sx, sy, Math.max(2, 0.15 * k), 0, 7); ctx.fill();
+}
+function drawDog() {
+  if (!dog) return;
+  const x = 400 + dog.side * 300, y = 420, s = 1 + Math.sin(time * 12) * 0.03;
+  ctx.save(); ctx.translate(x, y); ctx.scale(dog.side * s, s);
+  ctx.fillStyle = '#a0662e';
+  ctx.fillRect(-40, -45, 80, 40);            // 体
+  ctx.fillRect(25, -75, 38, 38);             // 頭
+  ctx.fillRect(55, -62, 20, 16);             // 鼻
+  ctx.fillRect(-36, -8, 12, 28); ctx.fillRect(22, -8, 12, 28);
+  ctx.fillStyle = '#6b3d14'; ctx.fillRect(28, -88, 12, 20);
+  ctx.fillStyle = '#000'; ctx.fillRect(48, -66, 5, 5); ctx.fillRect(68, -62, 7, 7);
+  ctx.strokeStyle = '#a0662e'; ctx.lineWidth = 8; ctx.beginPath(); ctx.moveTo(-40, -40); ctx.lineTo(-62, -70 + Math.sin(time * 14) * 8); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(dog.side < 0 ? '← ワン！' : 'ワン！ →', x, y - 100);
+}
+function drawGoal() {
+  const dz = GOAL - d; if (dz < 1 || dz > 90) return;
+  const [sx, gy] = proj(0, 0, dz), k = F / dz;
+  ctx.fillStyle = '#c9a66b'; ctx.fillRect(sx - 5 * k, gy - 5 * k, 10 * k, 5 * k);
+  ctx.fillStyle = '#7a4a22'; ctx.fillRect(sx - 5.4 * k, gy - 5.8 * k, 10.8 * k, 0.8 * k);
+  ctx.fillStyle = '#333'; ctx.fillRect(sx - 1 * k, gy - 2.6 * k, 2 * k, 2.6 * k);
+  ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.max(8, 1.3 * k)}px sans-serif`; ctx.textAlign = 'center';
+  ctx.fillText('食堂', sx, gy - 3.4 * k);
+}
+function drawBike() {
+  const sway = px * 40;
+  ctx.fillStyle = '#333'; ctx.fillRect(400 + sway - 90, 470, 180, 10);              // ハンドル
+  ctx.fillRect(400 + sway - 6, 480, 12, 30);
+  ctx.fillStyle = '#111'; ctx.fillRect(400 + sway - 105, 462, 30, 24); ctx.fillRect(400 + sway + 75, 462, 30, 24);
+}
+function render() {
+  // 空・地面
+  const g = ctx.createLinearGradient(0, 0, 0, HOR); g.addColorStop(0, '#8fb8d8'); g.addColorStop(1, '#f2dcb3');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 800, HOR);
+  ctx.fillStyle = '#7a8a3a'; ctx.fillRect(0, HOR, 800, 310);
+  // 道（縞で速度感）
+  for (let z = 80; z > 0.6; z -= 1) {
+    const y1 = HOR + CAMH * F / z, y2 = HOR + CAMH * F / (z - 1 > 0.5 ? z - 1 : 0.5), hw = W * F / z;
+    const n = Math.floor(d + z) % 4;
+    ctx.fillStyle = n < 2 ? '#8a8378' : '#7d766c';
+    ctx.fillRect(400 - px * W * F / z - hw, y1, hw * 2, y2 - y1 + 1);
+    if (n < 1) { ctx.fillStyle = '#e8d9a0'; ctx.fillRect(400 - px * W * F / z - 2, y1, 4, y2 - y1 + 1); }
+  }
+  // 落ち葉（演出）
+  ctx.fillStyle = '#c4551b';
+  for (let i = 0; i < 12; i++) { const z = ((i * 7 - d) % 40 + 40) % 40 + 2, x = (i % 2 ? 1 : -1) * ((i * 0.37) % 1 + 0.2) * W, [sx, sy] = proj(x, 0, z); ctx.fillRect(sx, sy, 3 + 40 / z, 2 + 20 / z); }
+  // 遠→近 の順に描画
+  const objs = [];
+  for (let z = Math.floor(d / 8) * 8; z < d + 80; z += 8) { const i = z / 8; objs.push([z, () => drawTree(-1, z, i)], [z + .1, () => drawTree(1, z + 0, i + 1)]); }
+  bugs.forEach(b => objs.push([b.z, () => drawBug(b)]));
+  objs.push([GOAL, drawGoal]);
+  objs.sort((a, b) => b[0] - a[0]).forEach(o => o[1]());
+  drawDog();
+  // 当たった汚れ
+  splats.forEach(s => { ctx.globalAlpha = Math.min(1, s.life); ctx.fillStyle = '#4b5a14';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7); ctx.arc(s.x + s.r * .8, s.y + s.r * .4, s.r * .5, 0, 7); ctx.arc(s.x - s.r * .6, s.y - s.r * .5, s.r * .4, 0, 7); ctx.fill(); });
+  ctx.globalAlpha = 1;
+  drawBike();
+  // HUD
+  ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(0, 0, 800, 34);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(`⏱ ${time.toFixed(1)}秒`, 12, 24);
+  ctx.textAlign = 'center'; ctx.fillText(`速度 ${(v * 3.6).toFixed(0)} km/h`, 400, 24);
+  ctx.textAlign = 'right'; ctx.fillText(`残り ${Math.max(0, GOAL - d).toFixed(0)} m`, 788, 24);
+  ctx.fillStyle = '#444'; ctx.fillRect(12, 38, 776, 6); ctx.fillStyle = '#ffb347'; ctx.fillRect(12, 38, 776 * Math.min(1, d / GOAL), 6);
+  if (msgT > 0) { ctx.textAlign = 'center'; ctx.font = 'bold 28px sans-serif'; ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 4; ctx.strokeText(msg, 400, 90); ctx.fillText(msg, 400, 90); }
+}
+
+// ---------- ループ・入力 ----------
+let last = performance.now();
+function loop(t) {
+  const dt = Math.min(0.05, (t - last) / 1000); last = t;
+  if (state === 'play') update(dt);
+  if (d !== undefined) render(); else { ctx.fillStyle = '#7a8a3a'; ctx.fillRect(0, 0, 800, 500); }
+  requestAnimationFrame(loop);
+}
+addEventListener('keydown', e => { if (e.key.startsWith('Arrow')) { keys[e.key] = true; e.preventDefault(); } });
+addEventListener('keyup', e => { keys[e.key] = false; });
+function touch(e, on) {
+  e.preventDefault(); keys.ArrowLeft = keys.ArrowRight = false;
+  if (!on) return;
+  const r = cv.getBoundingClientRect();
+  for (const t of e.touches) (t.clientX - r.left < r.width / 2) ? keys.ArrowLeft = true : keys.ArrowRight = true;
+}
+cv.addEventListener('touchstart', e => touch(e, true), { passive: false });
+cv.addEventListener('touchmove', e => touch(e, true), { passive: false });
+cv.addEventListener('touchend', e => touch(e, e.touches.length > 0), { passive: false });
+
+showIntro();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
